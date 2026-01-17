@@ -1,0 +1,598 @@
+#!/usr/bin/env bash
+#
+# mu - Multi-Utility Script
+# A collection of useful utilities with friendly output
+# Compatible with macOS (Darwin) and Linux
+#
+# Usage: mu <command> [options]
+#
+# Commands:
+#   clone    Clone repositories from a list of links with rate limiting
+#   help     Show this help message
+#
+
+set -euo pipefail
+
+#--------------------------------------------------------------------------------------------------
+# Constants
+#--------------------------------------------------------------------------------------------------
+
+readonly VERSION="0.1.0"
+readonly SCRIPT_NAME="mu"
+
+# Default values
+readonly DEFAULT_DELAY=2          # seconds between clones
+readonly DEFAULT_OUTPUT_DIR="."   # current directory
+
+#--------------------------------------------------------------------------------------------------
+# Colors & Styling
+#--------------------------------------------------------------------------------------------------
+
+# Check if terminal supports colors
+if [[ -t 1 ]] && command -v tput &>/dev/null && [[ $(tput colors 2>/dev/null || echo 0) -ge 8 ]]; then
+    readonly COLOR_RESET="\033[0m"
+    readonly COLOR_BOLD="\033[1m"
+    readonly COLOR_DIM="\033[2m"
+    readonly COLOR_RED="\033[31m"
+    readonly COLOR_GREEN="\033[32m"
+    readonly COLOR_YELLOW="\033[33m"
+    readonly COLOR_BLUE="\033[34m"
+    readonly COLOR_MAGENTA="\033[35m"
+    readonly COLOR_CYAN="\033[36m"
+    readonly COLOR_WHITE="\033[37m"
+else
+    readonly COLOR_RESET=""
+    readonly COLOR_BOLD=""
+    readonly COLOR_DIM=""
+    readonly COLOR_RED=""
+    readonly COLOR_GREEN=""
+    readonly COLOR_YELLOW=""
+    readonly COLOR_BLUE=""
+    readonly COLOR_MAGENTA=""
+    readonly COLOR_CYAN=""
+    readonly COLOR_WHITE=""
+fi
+
+#--------------------------------------------------------------------------------------------------
+# Output Helpers
+#--------------------------------------------------------------------------------------------------
+
+# Print styled header
+print_header() {
+    echo -e "\n${COLOR_BOLD}${COLOR_BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${COLOR_RESET}"
+    echo -e "${COLOR_BOLD}${COLOR_BLUE}  $1${COLOR_RESET}"
+    echo -e "${COLOR_BOLD}${COLOR_BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${COLOR_RESET}\n"
+}
+
+# Print info message
+info() {
+    echo -e "${COLOR_CYAN}ℹ${COLOR_RESET}  $1"
+}
+
+# Print success message
+success() {
+    echo -e "${COLOR_GREEN}✓${COLOR_RESET}  $1"
+}
+
+# Print warning message
+warn() {
+    echo -e "${COLOR_YELLOW}⚠${COLOR_RESET}  $1"
+}
+
+# Print error message
+error() {
+    echo -e "${COLOR_RED}✗${COLOR_RESET}  $1" >&2
+}
+
+# Print progress indicator
+progress() {
+    echo -e "${COLOR_MAGENTA}→${COLOR_RESET}  $1"
+}
+
+# Print dim/secondary text
+dim() {
+    echo -e "${COLOR_DIM}   $1${COLOR_RESET}"
+}
+
+# Print a separator line
+separator() {
+    echo -e "${COLOR_DIM}──────────────────────────────────────────────────────────${COLOR_RESET}"
+}
+
+# Print a progress bar
+# Usage: progress_bar <current> <total> <width>
+progress_bar() {
+    local current="$1"
+    local total="$2"
+    local width="${3:-40}"
+    local percent=$((current * 100 / total))
+    local filled=$((current * width / total))
+    local empty=$((width - filled))
+
+    # Build the bar
+    local bar=""
+    for ((i = 0; i < filled; i++)); do bar+="█"; done
+    for ((i = 0; i < empty; i++)); do bar+="░"; done
+
+    # Print with carriage return for in-place update
+    printf "\r  ${COLOR_CYAN}[${COLOR_GREEN}%s${COLOR_DIM}%s${COLOR_CYAN}]${COLOR_RESET} ${COLOR_BOLD}%3d%%${COLOR_RESET} (%d/%d)" \
+        "$(printf '%*s' "$filled" '' | tr ' ' '█')" \
+        "$(printf '%*s' "$empty" '' | tr ' ' '░')" \
+        "$percent" "$current" "$total"
+}
+
+#--------------------------------------------------------------------------------------------------
+# Utility Functions
+#--------------------------------------------------------------------------------------------------
+
+# Cross-platform sleep that works on both macOS and Linux
+# Supports fractional seconds
+portable_sleep() {
+    local seconds="$1"
+
+    if command -v perl &>/dev/null; then
+        perl -e "select(undef, undef, undef, $seconds)"
+    else
+        # Fallback to regular sleep (may not support fractions on older systems)
+        sleep "$seconds"
+    fi
+}
+
+# Extract the base repository URL from a GitHub link
+# Handles: /tree/branch/path, /blob/branch/path, direct repo links
+extract_repo_url() {
+    local url="$1"
+
+    # Remove trailing slashes
+    url="${url%/}"
+
+    # Check if it's a GitHub URL
+    if [[ "$url" =~ ^https?://github\.com/([^/]+)/([^/]+) ]]; then
+        local owner="${BASH_REMATCH[1]}"
+        local repo="${BASH_REMATCH[2]}"
+
+        # Remove .git suffix if present for matching, add back later
+        repo="${repo%.git}"
+
+        # Return the clean repo URL
+        echo "https://github.com/${owner}/${repo}.git"
+        return 0
+    fi
+
+    # Check if it's a GitLab URL (similar structure)
+    if [[ "$url" =~ ^https?://gitlab\.com/([^/]+)/([^/]+) ]]; then
+        local owner="${BASH_REMATCH[1]}"
+        local repo="${BASH_REMATCH[2]}"
+        repo="${repo%.git}"
+        echo "https://gitlab.com/${owner}/${repo}.git"
+        return 0
+    fi
+
+    # For other git URLs, return as-is (assuming they're valid)
+    if [[ "$url" =~ \.git$ ]] || [[ "$url" =~ ^git@ ]]; then
+        echo "$url"
+        return 0
+    fi
+
+    # Return empty for non-git URLs
+    echo ""
+    return 1
+}
+
+# Get owner/org from URL (e.g., "awslabs" from github.com/awslabs/mcp)
+get_repo_owner() {
+    local url="$1"
+
+    if [[ "$url" =~ ^https?://github\.com/([^/]+)/([^/]+) ]]; then
+        echo "${BASH_REMATCH[1]}"
+        return 0
+    fi
+
+    if [[ "$url" =~ ^https?://gitlab\.com/([^/]+)/([^/]+) ]]; then
+        echo "${BASH_REMATCH[1]}"
+        return 0
+    fi
+
+    # For other URLs, return empty
+    echo ""
+}
+
+# Get repository name from URL
+get_repo_name() {
+    local url="$1"
+    local repo_url
+
+    repo_url=$(extract_repo_url "$url") || return 1
+
+    # Extract repo name from URL
+    local name
+    name=$(basename "$repo_url" .git)
+    echo "$name"
+}
+
+# Check if a directory exists and is a git repo
+is_git_repo() {
+    local dir="$1"
+    [[ -d "$dir/.git" ]]
+}
+
+#--------------------------------------------------------------------------------------------------
+# Command: clone
+#--------------------------------------------------------------------------------------------------
+
+clone_usage() {
+    echo -e "${COLOR_BOLD}Usage:${COLOR_RESET} $SCRIPT_NAME clone [options] <links-file>
+
+Clone git repositories from a list of URLs with rate limiting.
+
+${COLOR_BOLD}Arguments:${COLOR_RESET}
+  <links-file>          File containing repository URLs (one per line)
+
+${COLOR_BOLD}Options:${COLOR_RESET}
+  -d, --delay <secs>    Delay between clones (default: ${DEFAULT_DELAY}s)
+  -o, --output <dir>    Output directory for clones (default: current dir)
+  -s, --shallow         Perform shallow clones (--depth 1 --single-branch)
+  -n, --dry-run         Show what would be cloned without cloning
+  -q, --quiet           Minimal output (progress bar only)
+  -h, --help            Show this help message
+
+${COLOR_BOLD}Features:${COLOR_RESET}
+  • Pre-scans links to show statistics before cloning
+  • Shows git clone progress for each repository
+  • Clean Ctrl+C handling with partial progress summary
+  • Only clones primary branch (--single-branch)
+  • Automatically extracts repo URLs from GitHub file/folder links
+  • Skips already cloned repositories, duplicates, and non-git URLs
+
+${COLOR_BOLD}Examples:${COLOR_RESET}
+  $SCRIPT_NAME clone links.txt
+  $SCRIPT_NAME clone -d 5 -o ./repos links.txt
+  $SCRIPT_NAME clone --shallow --quiet links.txt
+"
+}
+
+cmd_clone() {
+    local links_file=""
+    local delay="$DEFAULT_DELAY"
+    local output_dir="$DEFAULT_OUTPUT_DIR"
+    local shallow=false
+    local dry_run=false
+    local quiet=false
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -d|--delay)
+                delay="$2"
+                shift 2
+                ;;
+            -o|--output)
+                output_dir="$2"
+                shift 2
+                ;;
+            -s|--shallow)
+                shallow=true
+                shift
+                ;;
+            -n|--dry-run)
+                dry_run=true
+                shift
+                ;;
+            -q|--quiet)
+                quiet=true
+                shift
+                ;;
+            -h|--help)
+                clone_usage
+                return 0
+                ;;
+            -*)
+                error "Unknown option: $1"
+                clone_usage
+                return 1
+                ;;
+            *)
+                if [[ -z "$links_file" ]]; then
+                    links_file="$1"
+                else
+                    error "Unexpected argument: $1"
+                    clone_usage
+                    return 1
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # Validate arguments
+    if [[ -z "$links_file" ]]; then
+        error "Missing required argument: <links-file>"
+        echo ""
+        clone_usage
+        return 1
+    fi
+
+    if [[ ! -f "$links_file" ]]; then
+        error "File not found: $links_file"
+        return 1
+    fi
+
+    # Create temp files for processing (bash 3.x compatible)
+    local processed_file repos_file
+    processed_file=$(mktemp)
+    repos_file=$(mktemp)
+    trap "rm -f '$processed_file' '$repos_file'" EXIT
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Phase 1: Pre-scan to analyze links and build clone list
+    # ─────────────────────────────────────────────────────────────────────────
+
+    $quiet || info "Scanning links file..."
+
+    local total_urls=0
+    local skipped_invalid=0
+    local skipped_duplicate=0
+    local skipped_existing=0
+
+    while IFS= read -r url || [[ -n "$url" ]]; do
+        # Skip empty lines and comments
+        [[ -z "$url" ]] && continue
+        [[ "$url" =~ ^[[:space:]]*# ]] && continue
+
+        # Trim whitespace
+        url=$(echo "$url" | xargs)
+        ((total_urls++)) || true
+
+        # Extract repository URL
+        local repo_url
+        repo_url=$(extract_repo_url "$url") || true
+
+        if [[ -z "$repo_url" ]]; then
+            ((skipped_invalid++)) || true
+            continue
+        fi
+
+        # Get repo owner and name
+        local repo_owner repo_name
+        repo_owner=$(get_repo_owner "$url") || true
+        repo_name=$(get_repo_name "$url") || true
+
+        if [[ -z "$repo_name" ]]; then
+            ((skipped_invalid++)) || true
+            continue
+        fi
+
+        # Check for duplicates (by URL)
+        if grep -qxF "$repo_url" "$processed_file" 2>/dev/null; then
+            ((skipped_duplicate++)) || true
+            continue
+        fi
+        echo "$repo_url" >> "$processed_file"
+
+        # Check if already cloned
+        local target_dir="$output_dir/$repo_name"
+        if is_git_repo "$target_dir"; then
+            ((skipped_existing++)) || true
+            continue
+        fi
+
+        # Add to clone list: repo_url|repo_owner|repo_name|target_dir
+        echo "${repo_url}|${repo_owner}|${repo_name}|${target_dir}" >> "$repos_file"
+
+    done < "$links_file"
+
+    local repos_to_clone
+    repos_to_clone=$(wc -l < "$repos_file" | tr -d ' ')
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Phase 2: Display scan results
+    # ─────────────────────────────────────────────────────────────────────────
+
+    print_header "Git Clone with Rate Limiting"
+
+    echo -e "  ${COLOR_BOLD}Links file:${COLOR_RESET}      $links_file"
+    echo -e "  ${COLOR_BOLD}Output dir:${COLOR_RESET}      $output_dir"
+    echo -e "  ${COLOR_BOLD}Delay:${COLOR_RESET}           ${delay}s between clones"
+    $shallow && echo -e "  ${COLOR_BOLD}Mode:${COLOR_RESET}            shallow (--depth 1 --single-branch)"
+    $dry_run && echo -e "  ${COLOR_YELLOW}${COLOR_BOLD}Dry run:${COLOR_RESET}         no actual cloning"
+    echo ""
+    separator
+    echo -e "  ${COLOR_BOLD}Scan Results${COLOR_RESET}"
+    separator
+    echo -e "  Total URLs in file:    ${COLOR_BOLD}$total_urls${COLOR_RESET}"
+    echo -e "  ${COLOR_GREEN}Repos to clone:${COLOR_RESET}      ${COLOR_BOLD}${COLOR_GREEN}$repos_to_clone${COLOR_RESET}"
+    [[ $skipped_existing -gt 0 ]] && echo -e "  ${COLOR_YELLOW}Already cloned:${COLOR_RESET}      $skipped_existing"
+    [[ $skipped_duplicate -gt 0 ]] && echo -e "  ${COLOR_YELLOW}Duplicates:${COLOR_RESET}          $skipped_duplicate"
+    [[ $skipped_invalid -gt 0 ]] && echo -e "  ${COLOR_DIM}Invalid/non-git:${COLOR_RESET}     $skipped_invalid"
+    echo ""
+
+    # Nothing to clone?
+    if [[ $repos_to_clone -eq 0 ]]; then
+        info "Nothing to clone."
+        return 0
+    fi
+
+    # Create output directory if needed
+    if [[ ! -d "$output_dir" ]]; then
+        if $dry_run; then
+            info "Would create directory: $output_dir"
+        else
+            mkdir -p "$output_dir"
+            $quiet || info "Created output directory: $output_dir"
+        fi
+    fi
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Phase 3: Clone repositories with per-repo progress
+    # ─────────────────────────────────────────────────────────────────────────
+
+    local current=0
+    local cloned=0
+    local failed=0
+    local interrupted=false
+    local current_repo=""
+    local current_target=""
+
+    # Signal handler for clean exit
+    cleanup_and_exit() {
+        interrupted=true
+        echo ""
+        echo ""
+        warn "Interrupted! Cleaning up..."
+
+        # Remove partially cloned repo if exists
+        if [[ -n "$current_target" ]] && [[ -d "$current_target" ]] && ! is_git_repo "$current_target"; then
+            dim "Removing incomplete clone: $current_target"
+            rm -rf "$current_target"
+        fi
+
+        # Show partial summary
+        echo ""
+        separator
+        echo -e "  ${COLOR_YELLOW}${COLOR_BOLD}Interrupted after $current of $repos_to_clone repos${COLOR_RESET}"
+        separator
+        echo -e "  ${COLOR_GREEN}Successfully cloned:${COLOR_RESET}   ${COLOR_BOLD}$cloned${COLOR_RESET}"
+        [[ $failed -gt 0 ]] && echo -e "  ${COLOR_RED}Failed:${COLOR_RESET}                ${COLOR_BOLD}$failed${COLOR_RESET}"
+        echo ""
+
+        # Cleanup temp files
+        rm -f "$processed_file" "$repos_file"
+        exit 130
+    }
+
+    # Set up signal handlers
+    trap cleanup_and_exit SIGINT SIGTERM
+
+    separator
+    echo -e "  ${COLOR_BOLD}Cloning${COLOR_RESET} (Ctrl+C to stop)"
+    separator
+    echo ""
+
+    while IFS='|' read -r repo_url repo_owner repo_name target_dir; do
+        # Check if interrupted
+        $interrupted && break
+
+        ((current++)) || true
+        current_repo="$repo_name"
+        current_target="$target_dir"
+
+        # Build display name (owner/repo or just repo if no owner)
+        local display_name="$repo_name"
+        [[ -n "$repo_owner" ]] && display_name="${repo_owner}/${repo_name}"
+
+        # Show which repo we're cloning
+        echo -e "${COLOR_CYAN}[$current/$repos_to_clone]${COLOR_RESET} ${COLOR_BOLD}$display_name${COLOR_RESET}"
+
+        if $dry_run; then
+            dim "Would clone to: $target_dir"
+            ((cloned++)) || true
+        else
+            # Perform the clone - output directly to terminal for real-time progress
+            # No piping to avoid buffering issues with git's \r-based progress
+            if git clone --single-branch --progress \
+                $($shallow && echo "--depth 1") \
+                "$repo_url" "$target_dir"; then
+                success "Done: $display_name"
+                ((cloned++)) || true
+            else
+                error "Failed: $display_name"
+                ((failed++)) || true
+            fi
+
+            # Rate limiting delay (skip on last item)
+            if [[ $current -lt $repos_to_clone ]]; then
+                $quiet || dim "Waiting ${delay}s..."
+                portable_sleep "$delay"
+            fi
+        fi
+
+        echo ""
+
+    done < "$repos_file"
+
+    # Reset trap
+    trap - SIGINT SIGTERM
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Phase 4: Summary
+    # ─────────────────────────────────────────────────────────────────────────
+
+    print_header "Summary"
+
+    echo -e "  ${COLOR_GREEN}Successfully cloned:${COLOR_RESET}   ${COLOR_BOLD}$cloned${COLOR_RESET}"
+    [[ $failed -gt 0 ]] && echo -e "  ${COLOR_RED}Failed:${COLOR_RESET}                ${COLOR_BOLD}$failed${COLOR_RESET}"
+    [[ $skipped_existing -gt 0 ]] && echo -e "  ${COLOR_YELLOW}Already existed:${COLOR_RESET}       $skipped_existing"
+    [[ $skipped_duplicate -gt 0 ]] && echo -e "  ${COLOR_YELLOW}Duplicates skipped:${COLOR_RESET}    $skipped_duplicate"
+    [[ $skipped_invalid -gt 0 ]] && echo -e "  ${COLOR_DIM}Invalid URLs:${COLOR_RESET}          $skipped_invalid"
+    echo ""
+
+    # Return appropriate exit code
+    [[ $failed -eq 0 ]]
+}
+
+#--------------------------------------------------------------------------------------------------
+# Command: help
+#--------------------------------------------------------------------------------------------------
+
+show_help() {
+    echo -e "${COLOR_BOLD}${SCRIPT_NAME}${COLOR_RESET} - Multi-Utility Script v${VERSION}
+
+A collection of useful command-line utilities with friendly output.
+Compatible with macOS (Darwin) and Linux.
+
+${COLOR_BOLD}Usage:${COLOR_RESET}
+  $SCRIPT_NAME <command> [options]
+
+${COLOR_BOLD}Commands:${COLOR_RESET}
+  clone       Clone git repositories from a list with rate limiting
+  help        Show this help message
+  version     Show version information
+
+${COLOR_BOLD}Examples:${COLOR_RESET}
+  $SCRIPT_NAME clone links.txt
+  $SCRIPT_NAME clone --help
+  $SCRIPT_NAME help
+
+Run '${COLOR_BOLD}$SCRIPT_NAME <command> --help${COLOR_RESET}' for command-specific help.
+"
+}
+
+show_version() {
+    echo -e "${COLOR_BOLD}$SCRIPT_NAME${COLOR_RESET} v${VERSION}"
+}
+
+#--------------------------------------------------------------------------------------------------
+# Main Entry Point
+#--------------------------------------------------------------------------------------------------
+
+main() {
+    # No arguments - show help
+    if [[ $# -eq 0 ]]; then
+        show_help
+        return 0
+    fi
+
+    local command="$1"
+    shift
+
+    case "$command" in
+        clone)
+            cmd_clone "$@"
+            ;;
+        help|--help|-h)
+            show_help
+            ;;
+        version|--version|-v)
+            show_version
+            ;;
+        *)
+            error "Unknown command: $command"
+            echo ""
+            show_help
+            return 1
+            ;;
+    esac
+}
+
+# Run main function
+main "$@"
