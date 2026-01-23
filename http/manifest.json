@@ -1,0 +1,43 @@
+{
+  "manifest_version": "0.3",
+  "name": "http",
+  "version": "0.1.0",
+  "description": "A simple HTTP MCP server without authentication",
+  "author": {
+    "name": "Stephen Akinyemi",
+    "email": "appcypher@outlook.com"
+  },
+  "server": {
+    "type": "binary",
+    "transport": "http",
+    "entry_point": "target/release/http",
+    "mcp_config": {
+      "command": "${__dirname}/target/release/http",
+      "args": ["--host=${system_config.hostname}", "--port=${system_config.port}"],
+      "url": "http://${system_config.hostname}:${system_config.port}/mcp"
+    }
+  },
+  "compatibility": {
+    "platforms": ["darwin"]
+  },
+  "system_config": {
+    "port": {
+      "type": "port",
+      "title": "Server Port",
+      "description": "Port for the MCP HTTP endpoint"
+    },
+    "hostname": {
+      "type": "hostname",
+      "title": "Bind Address",
+      "description": "Network interface to bind to",
+      "default": "127.0.0.1"
+    }
+  },
+  "_meta": {
+    "store.tool.mcpb": {
+      "scripts": {
+        "build": "cargo build --release"
+      }
+    }
+  }
+}
