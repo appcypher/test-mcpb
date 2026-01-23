@@ -33,7 +33,7 @@
     ]
   },
   "_meta": {
-    "company.superrad.radical": {
+    "store.tool.mcpb": {
       "scripts": {
         "build": "cargo build --release"
       }
