@@ -531,6 +531,663 @@ cmd_clone() {
 }
 
 #--------------------------------------------------------------------------------------------------
+# Command: detect
+#--------------------------------------------------------------------------------------------------
+
+detect_usage() {
+    echo -e "${COLOR_BOLD}Usage:${COLOR_RESET} $SCRIPT_NAME detect [options] <repos-dir>
+
+Scan a directory of repositories and detect which can be converted to MCPB packages.
+
+${COLOR_BOLD}Arguments:${COLOR_RESET}
+  <repos-dir>           Directory containing repository subdirectories
+
+${COLOR_BOLD}Options:${COLOR_RESET}
+  -t, --threshold <n>   Minimum confidence % to consider convertible (default: 80)
+  -l, --list            List all detected repos with details
+  -o, --output <file>   Write results to TSV file
+  -q, --quiet           Only show summary stats
+  -h, --help            Show this help message
+
+${COLOR_BOLD}Requires:${COLOR_RESET}
+  tool-cli must be installed (https://github.com/anthropics/tool-cli)
+
+${COLOR_BOLD}Examples:${COLOR_RESET}
+  $SCRIPT_NAME detect ./repos
+  $SCRIPT_NAME detect -t 90 --list ./repos
+  $SCRIPT_NAME detect -o results.tsv ./repos
+"
+}
+
+cmd_detect() {
+    local repos_dir=""
+    local threshold=80
+    local list_all=false
+    local output_file=""
+    local quiet=false
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -t|--threshold)
+                threshold="$2"
+                shift 2
+                ;;
+            -l|--list)
+                list_all=true
+                shift
+                ;;
+            -o|--output)
+                output_file="$2"
+                shift 2
+                ;;
+            -q|--quiet)
+                quiet=true
+                shift
+                ;;
+            -h|--help)
+                detect_usage
+                return 0
+                ;;
+            -*)
+                error "Unknown option: $1"
+                detect_usage
+                return 1
+                ;;
+            *)
+                if [[ -z "$repos_dir" ]]; then
+                    repos_dir="$1"
+                else
+                    error "Unexpected argument: $1"
+                    detect_usage
+                    return 1
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # Validate arguments
+    if [[ -z "$repos_dir" ]]; then
+        error "Missing required argument: <repos-dir>"
+        echo ""
+        detect_usage
+        return 1
+    fi
+
+    if [[ ! -d "$repos_dir" ]]; then
+        error "Directory not found: $repos_dir"
+        return 1
+    fi
+
+    # Check if tool-cli is available
+    if ! command -v tool &>/dev/null; then
+        error "tool-cli is not installed"
+        dim "Install it from: https://github.com/anthropics/tool-cli"
+        return 1
+    fi
+
+    print_header "MCPB Package Detection"
+
+    echo -e "  ${COLOR_BOLD}Repos dir:${COLOR_RESET}       $repos_dir"
+    echo -e "  ${COLOR_BOLD}Threshold:${COLOR_RESET}       ${threshold}% confidence"
+    echo ""
+
+    # Stats counters
+    local total=0
+    local convertible=0
+    local low_confidence=0
+    local failed=0
+
+    # Type counters (bash 3.x compatible)
+    local count_nodejs=0
+    local count_python=0
+    local count_rust=0
+    local count_binary=0
+    local count_other=0
+
+    # Transport counters
+    local count_stdio=0
+    local count_http=0
+
+    # Results storage
+    local results_file
+    results_file=$(mktemp)
+    trap "rm -f '$results_file'" EXIT
+
+    # Write header to results
+    echo -e "repo\ttype\ttransport\tentry\tconfidence\tbuild" >> "$results_file"
+
+    separator
+    echo -e "  ${COLOR_BOLD}Scanning${COLOR_RESET}"
+    separator
+    echo ""
+
+    # Iterate through subdirectories
+    for dir in "$repos_dir"/*/; do
+        [[ ! -d "$dir" ]] && continue
+
+        local repo_name
+        repo_name=$(basename "$dir")
+        ((total++)) || true
+
+        $quiet || progress "Scanning: $repo_name"
+
+        # Run tool detect
+        local detect_output
+        if detect_output=$(tool detect --concise --no-header "$dir" 2>/dev/null); then
+            # Parse tab-separated output: type, transport, entry, confidence, build
+            local type transport entry confidence build
+            IFS=$'\t' read -r type transport entry confidence build <<< "$detect_output"
+
+            # Remove % from confidence and convert to number
+            local conf_num="${confidence%\%}"
+
+            # Store result
+            echo -e "${repo_name}\t${type}\t${transport}\t${entry}\t${confidence}\t${build}" >> "$results_file"
+
+            # Update type counters
+            case "$type" in
+                Node.js|node) ((count_nodejs++)) || true ;;
+                Python|python) ((count_python++)) || true ;;
+                Rust|rust) ((count_rust++)) || true ;;
+                Binary|binary) ((count_binary++)) || true ;;
+                *) ((count_other++)) || true ;;
+            esac
+
+            # Update transport counters
+            case "$transport" in
+                stdio) ((count_stdio++)) || true ;;
+                http) ((count_http++)) || true ;;
+            esac
+
+            # Check threshold
+            if [[ "$conf_num" -ge "$threshold" ]]; then
+                ((convertible++)) || true
+                $quiet || success "$repo_name ${COLOR_DIM}(${type}, ${confidence})${COLOR_RESET}"
+            else
+                ((low_confidence++)) || true
+                $quiet || warn "$repo_name ${COLOR_DIM}(${type}, ${confidence} - below threshold)${COLOR_RESET}"
+            fi
+        else
+            ((failed++)) || true
+            $quiet || error "$repo_name ${COLOR_DIM}(detection failed)${COLOR_RESET}"
+        fi
+    done
+
+    echo ""
+
+    # Write to output file if specified
+    if [[ -n "$output_file" ]]; then
+        cp "$results_file" "$output_file"
+        info "Results written to: $output_file"
+        echo ""
+    fi
+
+    # Show list if requested
+    if $list_all && ! $quiet; then
+        separator
+        echo -e "  ${COLOR_BOLD}Convertible Repos${COLOR_RESET} (≥${threshold}% confidence)"
+        separator
+        echo ""
+        echo -e "  ${COLOR_DIM}REPO\tTYPE\tTRANSPORT\tCONFIDENCE${COLOR_RESET}"
+        tail -n +2 "$results_file" | while IFS=$'\t' read -r repo type transport entry confidence build; do
+            local conf_num="${confidence%\%}"
+            if [[ "$conf_num" -ge "$threshold" ]]; then
+                printf "  %-30s %-10s %-8s %s\n" "$repo" "$type" "$transport" "$confidence"
+            fi
+        done
+        echo ""
+    fi
+
+    # Summary
+    print_header "Summary"
+
+    echo -e "  ${COLOR_BOLD}Total scanned:${COLOR_RESET}       $total"
+    echo -e "  ${COLOR_GREEN}Convertible:${COLOR_RESET}         ${COLOR_BOLD}$convertible${COLOR_RESET} (≥${threshold}%)"
+    [[ $low_confidence -gt 0 ]] && echo -e "  ${COLOR_YELLOW}Low confidence:${COLOR_RESET}      $low_confidence (<${threshold}%)"
+    [[ $failed -gt 0 ]] && echo -e "  ${COLOR_RED}Failed:${COLOR_RESET}              $failed"
+    echo ""
+
+    separator
+    echo -e "  ${COLOR_BOLD}By Type${COLOR_RESET}"
+    separator
+    [[ $count_nodejs -gt 0 ]] && echo -e "  Node.js:           $count_nodejs"
+    [[ $count_python -gt 0 ]] && echo -e "  Python:            $count_python"
+    [[ $count_rust -gt 0 ]] && echo -e "  Rust:              $count_rust"
+    [[ $count_binary -gt 0 ]] && echo -e "  Binary:            $count_binary"
+    [[ $count_other -gt 0 ]] && echo -e "  Other:             $count_other"
+    echo ""
+
+    separator
+    echo -e "  ${COLOR_BOLD}By Transport${COLOR_RESET}"
+    separator
+    [[ $count_stdio -gt 0 ]] && echo -e "  stdio:             $count_stdio"
+    [[ $count_http -gt 0 ]] && echo -e "  http:              $count_http"
+    echo ""
+}
+
+#--------------------------------------------------------------------------------------------------
+# Command: convert
+#--------------------------------------------------------------------------------------------------
+
+convert_usage() {
+    echo -e "${COLOR_BOLD}Usage:${COLOR_RESET} $SCRIPT_NAME convert [options] <repos-dir>
+
+Convert repositories to MCPB packages using tool-cli.
+
+Runs the full pipeline for each repo: detect → init → validate → build → info
+
+${COLOR_BOLD}Arguments:${COLOR_RESET}
+  <repos-dir>           Directory containing repository subdirectories
+
+${COLOR_BOLD}Options:${COLOR_RESET}
+  -t, --threshold <n>   Minimum confidence % to convert (default: 80)
+  -i, --info-timeout <s> Timeout for 'tool info' in seconds (default: 30)
+  -f, --force           Overwrite existing manifest.json files
+  -n, --dry-run         Show what would be converted without converting
+  -o, --output <file>   Write results to TSV file
+  -q, --quiet           Minimal output (summary only)
+  -h, --help            Show this help message
+
+${COLOR_BOLD}Requires:${COLOR_RESET}
+  tool-cli must be installed
+
+${COLOR_BOLD}Examples:${COLOR_RESET}
+  $SCRIPT_NAME convert ./repos
+  $SCRIPT_NAME convert -t 90 -i 60 ./repos
+  $SCRIPT_NAME convert --dry-run ./repos
+  $SCRIPT_NAME convert -f -o results.tsv ./repos
+"
+}
+
+cmd_convert() {
+    local repos_dir=""
+    local threshold=80
+    local info_timeout=30
+    local force=false
+    local dry_run=false
+    local output_file=""
+    local quiet=false
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -t|--threshold)
+                threshold="$2"
+                shift 2
+                ;;
+            -i|--info-timeout)
+                info_timeout="$2"
+                shift 2
+                ;;
+            -f|--force)
+                force=true
+                shift
+                ;;
+            -n|--dry-run)
+                dry_run=true
+                shift
+                ;;
+            -o|--output)
+                output_file="$2"
+                shift 2
+                ;;
+            -q|--quiet)
+                quiet=true
+                shift
+                ;;
+            -h|--help)
+                convert_usage
+                return 0
+                ;;
+            -*)
+                error "Unknown option: $1"
+                convert_usage
+                return 1
+                ;;
+            *)
+                if [[ -z "$repos_dir" ]]; then
+                    repos_dir="$1"
+                else
+                    error "Unexpected argument: $1"
+                    convert_usage
+                    return 1
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # Validate arguments
+    if [[ -z "$repos_dir" ]]; then
+        error "Missing required argument: <repos-dir>"
+        echo ""
+        convert_usage
+        return 1
+    fi
+
+    if [[ ! -d "$repos_dir" ]]; then
+        error "Directory not found: $repos_dir"
+        return 1
+    fi
+
+    # Check if tool-cli is available
+    if ! command -v tool &>/dev/null; then
+        error "tool-cli is not installed"
+        dim "Install it from: https://github.com/anthropics/tool-cli"
+        return 1
+    fi
+
+    print_header "MCPB Package Conversion"
+
+    echo -e "  ${COLOR_BOLD}Repos dir:${COLOR_RESET}       $repos_dir"
+    echo -e "  ${COLOR_BOLD}Threshold:${COLOR_RESET}       ${threshold}% confidence"
+    echo -e "  ${COLOR_BOLD}Info timeout:${COLOR_RESET}    ${info_timeout}s"
+    echo -e "  ${COLOR_BOLD}Force:${COLOR_RESET}           $($force && echo "yes" || echo "no")"
+    $dry_run && echo -e "  ${COLOR_YELLOW}${COLOR_BOLD}Dry run:${COLOR_RESET}         no actual conversion"
+    echo ""
+
+    # Stage stats counters
+    local total=0
+    local stage_detect_ok=0
+    local stage_detect_fail=0
+    local stage_detect_low=0
+    local stage_init_ok=0
+    local stage_init_fail=0
+    local stage_init_skip=0
+    local stage_validate_ok=0
+    local stage_validate_fail=0
+    local stage_build_ok=0
+    local stage_build_fail=0
+    local stage_build_skip=0
+    local stage_info_ok=0
+    local stage_info_fail=0
+
+    # Fully working counter
+    local fully_working=0
+
+    # Results storage
+    local results_file
+    results_file=$(mktemp)
+    trap "rm -f '$results_file'" EXIT
+
+    echo -e "repo\tdetect\tinit\tvalidate\tbuild\tinfo\ttype\tconfidence\ttools\tprompts\tresources" >> "$results_file"
+
+    separator
+    echo -e "  ${COLOR_BOLD}Converting${COLOR_RESET} (detect → init → validate → build → info)"
+    separator
+    echo ""
+
+    # Count total repos first
+    local total_repos=0
+    for dir in "$repos_dir"/*/; do
+        [[ -d "$dir" ]] && ((total_repos++)) || true
+    done
+
+    # Iterate through subdirectories
+    local current=0
+    for dir in "$repos_dir"/*/; do
+        [[ ! -d "$dir" ]] && continue
+
+        local repo_name
+        repo_name=$(basename "$dir")
+        ((current++)) || true
+        ((total++)) || true
+
+        # Per-repo status tracking
+        local status_detect="-"
+        local status_init="-"
+        local status_validate="-"
+        local status_build="-"
+        local status_info="-"
+        local detected_type="-"
+        local detected_confidence="-"
+        local info_tools="-"
+        local info_prompts="-"
+        local info_resources="-"
+
+        # Print repo header
+        $quiet || echo -e "${COLOR_CYAN}[${current}/${total_repos}]${COLOR_RESET} ${COLOR_BOLD}${repo_name}${COLOR_RESET}"
+
+        # ─────────────────────────────────────────────────────────────────────
+        # Stage 1: Detect
+        # ─────────────────────────────────────────────────────────────────────
+        local detect_output detect_err
+        if detect_output=$(tool detect --concise --no-header "$dir" 2>&1); then
+            # Parse detection output: type, transport, entry, confidence, build
+            local type transport entry confidence build_cmd
+            IFS=$'\t' read -r type transport entry confidence build_cmd <<< "$detect_output"
+            local conf_num="${confidence%\%}"
+            detected_type="$type"
+            detected_confidence="$confidence"
+
+            # Check threshold
+            if [[ "$conf_num" -lt "$threshold" ]]; then
+                status_detect="low"
+                ((stage_detect_low++)) || true
+                $quiet || echo -e "  ├─ detect:    ${COLOR_YELLOW}${type}, ${transport}, ${confidence} (below ${threshold}%)${COLOR_RESET}"
+                $quiet || echo ""
+                echo -e "${repo_name}\t${status_detect}\t-\t-\t-\t-\t${type}\t${confidence}\t-\t-\t-" >> "$results_file"
+                continue
+            fi
+
+            status_detect="ok"
+            ((stage_detect_ok++)) || true
+            $quiet || echo -e "  ├─ detect:    ${COLOR_GREEN}${type}, ${transport}, ${confidence}${COLOR_RESET}"
+        else
+            detect_err=$(echo "$detect_output" | grep -iE "error|not found|failed" | head -1 | sed 's/^[[:space:]]*//' | cut -c1-50 || true)
+            [[ -z "$detect_err" ]] && detect_err="detection failed"
+            status_detect="fail"
+            ((stage_detect_fail++)) || true
+            $quiet || echo -e "  └─ detect:    ${COLOR_RED}failed${COLOR_RESET} ${COLOR_DIM}(${detect_err})${COLOR_RESET}"
+            $quiet || echo ""
+            echo -e "${repo_name}\t${status_detect}\t-\t-\t-\t-\t-\t-\t-\t-\t-" >> "$results_file"
+            continue
+        fi
+
+        # ─────────────────────────────────────────────────────────────────────
+        # Stage 2: Init
+        # ─────────────────────────────────────────────────────────────────────
+        local manifest_exists=false
+        [[ -f "$dir/manifest.json" ]] && manifest_exists=true
+
+        if $manifest_exists && ! $force; then
+            status_init="skip"
+            ((stage_init_skip++)) || true
+            $quiet || echo -e "  ├─ init:      ${COLOR_YELLOW}skipped (exists, use -f)${COLOR_RESET}"
+        elif $dry_run; then
+            local action="create"
+            $manifest_exists && action="overwrite"
+            status_init="dry"
+            $quiet || echo -e "  ├─ init:      ${COLOR_CYAN}would ${action}${COLOR_RESET}"
+        else
+            local init_flags="-y"
+            $force && init_flags="$init_flags -f"
+
+            local init_output
+            if init_output=$(tool init $init_flags "$dir" 2>&1); then
+                status_init="ok"
+                ((stage_init_ok++)) || true
+                local action="created"
+                $manifest_exists && action="overwrote"
+                $quiet || echo -e "  ├─ init:      ${COLOR_GREEN}${action} manifest.json${COLOR_RESET}"
+            else
+                local init_err
+                init_err=$(echo "$init_output" | grep -iE "error|failed|cannot" | head -1 | sed 's/^[[:space:]]*//' | cut -c1-50 || true)
+                [[ -z "$init_err" ]] && init_err="init failed"
+                status_init="fail"
+                ((stage_init_fail++)) || true
+                $quiet || echo -e "  └─ init:      ${COLOR_RED}failed${COLOR_RESET} ${COLOR_DIM}(${init_err})${COLOR_RESET}"
+                $quiet || echo ""
+                echo -e "${repo_name}\t${status_detect}\t${status_init}\t-\t-\t-\t${detected_type}\t${detected_confidence}\t-\t-\t-" >> "$results_file"
+                continue
+            fi
+        fi
+
+        # Skip remaining stages only if dry run
+        if $dry_run; then
+            $quiet || echo ""
+            echo -e "${repo_name}\t${status_detect}\t${status_init}\t-\t-\t-\t${detected_type}\t${detected_confidence}\t-\t-\t-" >> "$results_file"
+            continue
+        fi
+
+        # ─────────────────────────────────────────────────────────────────────
+        # Stage 3: Validate
+        # ─────────────────────────────────────────────────────────────────────
+        local validate_output
+        if validate_output=$(tool validate --quiet "$dir" 2>&1); then
+            status_validate="ok"
+            ((stage_validate_ok++)) || true
+            $quiet || echo -e "  ├─ validate:  ${COLOR_GREEN}valid${COLOR_RESET}"
+        else
+            status_validate="fail"
+            ((stage_validate_fail++)) || true
+            local validate_err
+            # Try to extract error code like error[missing_field]
+            validate_err=$(echo "$validate_output" | grep -oE "error\[[^\]]+\]" | head -1 || true)
+            # If no error code, try to get a message
+            if [[ -z "$validate_err" ]]; then
+                validate_err=$(echo "$validate_output" | grep -iE "error|invalid|missing" | head -1 | sed 's/^[[:space:]]*//' | cut -c1-40 || true)
+            fi
+            [[ -z "$validate_err" ]] && validate_err="invalid"
+            $quiet || echo -e "  ├─ validate:  ${COLOR_RED}failed${COLOR_RESET} ${COLOR_DIM}(${validate_err})${COLOR_RESET}"
+        fi
+
+        # ─────────────────────────────────────────────────────────────────────
+        # Stage 4: Build
+        # ─────────────────────────────────────────────────────────────────────
+        # Check if build script exists in manifest's _meta.store.tool.mcpb.scripts
+        local has_build_script=false
+        if [[ -f "$dir/manifest.json" ]]; then
+            if grep -q '"scripts"' "$dir/manifest.json" 2>/dev/null && \
+               grep -q '"build"' "$dir/manifest.json" 2>/dev/null; then
+                has_build_script=true
+            fi
+        fi
+
+        if $has_build_script; then
+            local build_output
+            if build_output=$(tool build "$dir" 2>&1); then
+                status_build="ok"
+                ((stage_build_ok++)) || true
+                $quiet || echo -e "  ├─ build:     ${COLOR_GREEN}success${COLOR_RESET}"
+            else
+                local build_err
+                # Try to get meaningful error from npm/pip/cargo etc
+                build_err=$(echo "$build_output" | grep -iE "error|ERR!|failed|cannot find|not found" | head -1 | sed 's/^[[:space:]]*//' | cut -c1-50 || true)
+                [[ -z "$build_err" ]] && build_err="build failed"
+                status_build="fail"
+                ((stage_build_fail++)) || true
+                $quiet || echo -e "  ├─ build:     ${COLOR_RED}failed${COLOR_RESET} ${COLOR_DIM}(${build_err})${COLOR_RESET}"
+            fi
+        else
+            status_build="skip"
+            ((stage_build_skip++)) || true
+            $quiet || echo -e "  ├─ build:     ${COLOR_DIM}skipped (no build script)${COLOR_RESET}"
+        fi
+
+        # ─────────────────────────────────────────────────────────────────────
+        # Stage 5: Info (the real test)
+        # ─────────────────────────────────────────────────────────────────────
+        local info_output
+        if info_output=$(timeout "${info_timeout}s" tool info --concise "$dir" 2>&1); then
+            # Parse concise output format:
+            # - Tools: lines with pattern "toolset:name(" after #tool header
+            # - Prompts: lines with pattern "toolset:name\t" after #prompt header
+            # - Resources: lines starting with URI (not #) after #uri header
+
+            # Count tools (lines containing "(" that aren't headers)
+            info_tools=$(echo "$info_output" | grep -c '(' 2>/dev/null) || info_tools="0"
+
+            # Count prompts (lines with tab after #prompt section, excluding headers)
+            info_prompts=$(echo "$info_output" | grep -E '^[^#].*\t"' 2>/dev/null | grep -v '^[a-z]+\t' 2>/dev/null | wc -l | tr -d ' ') || info_prompts="0"
+            # Simpler: count lines between #prompt and next # or EOF
+            local in_prompts=false
+            local prompt_count=0
+            while IFS= read -r line; do
+                if [[ "$line" == "#prompt"* ]]; then
+                    in_prompts=true
+                    continue
+                elif [[ "$line" == "#"* ]]; then
+                    in_prompts=false
+                elif $in_prompts && [[ -n "$line" ]]; then
+                    ((prompt_count++)) || true
+                fi
+            done <<< "$info_output"
+            info_prompts="$prompt_count"
+
+            # Count resources (lines between #uri and next # or EOF)
+            local in_resources=false
+            local resource_count=0
+            while IFS= read -r line; do
+                if [[ "$line" == "#uri"* ]]; then
+                    in_resources=true
+                    continue
+                elif [[ "$line" == "#"* ]]; then
+                    in_resources=false
+                elif $in_resources && [[ -n "$line" ]]; then
+                    ((resource_count++)) || true
+                fi
+            done <<< "$info_output"
+            info_resources="$resource_count"
+
+            status_info="ok"
+            ((stage_info_ok++)) || true
+            $quiet || echo -e "  └─ info:      ${COLOR_GREEN}${info_tools} tools, ${info_prompts} prompts, ${info_resources} resources${COLOR_RESET}"
+
+            # Count as fully working if validate passed and info succeeded
+            if [[ "$status_validate" == "ok" ]]; then
+                ((fully_working++)) || true
+            fi
+        else
+            local exit_code=$?
+            status_info="fail"
+            ((stage_info_fail++)) || true
+            if [[ $exit_code -eq 124 ]]; then
+                $quiet || echo -e "  └─ info:      ${COLOR_RED}failed${COLOR_RESET} ${COLOR_DIM}(timeout after ${info_timeout}s)${COLOR_RESET}"
+            else
+                local info_err
+                info_err=$(echo "$info_output" | grep -iE "error|failed|refused|not found|ENOENT|ECONNREFUSED" | head -1 | sed 's/^[[:space:]]*//' | cut -c1-50 || true)
+                [[ -z "$info_err" ]] && info_err="server failed to start"
+                $quiet || echo -e "  └─ info:      ${COLOR_RED}failed${COLOR_RESET} ${COLOR_DIM}(${info_err})${COLOR_RESET}"
+            fi
+        fi
+
+        $quiet || echo ""
+
+        # Write results
+        echo -e "${repo_name}\t${status_detect}\t${status_init}\t${status_validate}\t${status_build}\t${status_info}\t${detected_type}\t${detected_confidence}\t${info_tools}\t${info_prompts}\t${info_resources}" >> "$results_file"
+
+    done
+
+    # Write to output file if specified
+    if [[ -n "$output_file" ]]; then
+        cp "$results_file" "$output_file"
+        info "Results written to: $output_file"
+        echo ""
+    fi
+
+    # Summary
+    print_header "Summary"
+
+    echo -e "  ${COLOR_BOLD}Total scanned:${COLOR_RESET}       $total"
+    echo -e "  ${COLOR_GREEN}${COLOR_BOLD}Fully working:${COLOR_RESET}       ${COLOR_BOLD}$fully_working${COLOR_RESET} ${COLOR_DIM}(validate + info passed)${COLOR_RESET}"
+    echo ""
+
+    separator
+    echo -e "  ${COLOR_BOLD}By Stage${COLOR_RESET}"
+    separator
+    echo ""
+    printf "  %-12s ${COLOR_GREEN}%3d ok${COLOR_RESET}  ${COLOR_RED}%3d fail${COLOR_RESET}  ${COLOR_YELLOW}%3d low${COLOR_RESET}\n" "detect:" "$stage_detect_ok" "$stage_detect_fail" "$stage_detect_low"
+    printf "  %-12s ${COLOR_GREEN}%3d ok${COLOR_RESET}  ${COLOR_RED}%3d fail${COLOR_RESET}  ${COLOR_YELLOW}%3d skip${COLOR_RESET}\n" "init:" "$stage_init_ok" "$stage_init_fail" "$stage_init_skip"
+    printf "  %-12s ${COLOR_GREEN}%3d ok${COLOR_RESET}  ${COLOR_RED}%3d fail${COLOR_RESET}\n" "validate:" "$stage_validate_ok" "$stage_validate_fail"
+    printf "  %-12s ${COLOR_GREEN}%3d ok${COLOR_RESET}  ${COLOR_RED}%3d fail${COLOR_RESET}  ${COLOR_DIM}%3d skip${COLOR_RESET}\n" "build:" "$stage_build_ok" "$stage_build_fail" "$stage_build_skip"
+    printf "  %-12s ${COLOR_GREEN}%3d ok${COLOR_RESET}  ${COLOR_RED}%3d fail${COLOR_RESET}\n" "info:" "$stage_info_ok" "$stage_info_fail"
+    echo ""
+}
+
+#--------------------------------------------------------------------------------------------------
 # Command: help
 #--------------------------------------------------------------------------------------------------
 
@@ -545,12 +1202,15 @@ ${COLOR_BOLD}Usage:${COLOR_RESET}
 
 ${COLOR_BOLD}Commands:${COLOR_RESET}
   clone       Clone git repositories from a list with rate limiting
+  detect      Detect MCPB-convertible repos in a directory
+  convert     Convert repos to MCPB packages
   help        Show this help message
   version     Show version information
 
 ${COLOR_BOLD}Examples:${COLOR_RESET}
   $SCRIPT_NAME clone links.txt
-  $SCRIPT_NAME clone --help
+  $SCRIPT_NAME detect ./repos
+  $SCRIPT_NAME convert ./repos
   $SCRIPT_NAME help
 
 Run '${COLOR_BOLD}$SCRIPT_NAME <command> --help${COLOR_RESET}' for command-specific help.
@@ -578,6 +1238,12 @@ main() {
     case "$command" in
         clone)
             cmd_clone "$@"
+            ;;
+        detect)
+            cmd_detect "$@"
+            ;;
+        convert)
+            cmd_convert "$@"
             ;;
         help|--help|-h)
             show_help
