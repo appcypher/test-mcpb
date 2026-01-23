@@ -1,0 +1,41 @@
+{
+  "manifest_version": "0.3",
+  "name": "sensitive",
+  "version": "0.1.0",
+  "description": "An MCP server with sensitive user configuration",
+  "author": {
+    "name": "Stephen Akinyemi",
+    "email": "appcypher@outlook.com"
+  },
+  "server": {
+    "type": "binary",
+    "entry_point": "target/release/sensitive",
+    "mcp_config": {
+      "command": "${__dirname}/target/release/sensitive",
+      "env": {
+        "API_KEY": "${user_config.api_key}"
+      }
+    }
+  },
+  "user_config": {
+    "api_key": {
+      "type": "string",
+      "title": "API Key",
+      "description": "Your API key for authentication",
+      "required": true,
+      "sensitive": true
+    }
+  },
+  "compatibility": {
+    "platforms": [
+      "darwin"
+    ]
+  },
+  "_meta": {
+    "store.tool.mcpb": {
+      "scripts": {
+        "build": "cargo build --release"
+      }
+    }
+  }
+}
