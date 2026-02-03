@@ -17,6 +17,12 @@
       }
     }
   },
+  "tools": [
+    {
+      "name": "check_auth",
+      "description": "Check if API key is configured"
+    }
+  ],
   "user_config": {
     "api_key": {
       "type": "string",
@@ -35,6 +41,44 @@
     "store.tool.mcpb": {
       "scripts": {
         "build": "cargo build --release"
+      },
+      "static_responses": {
+        "tools/list": {
+          "tools": [
+            {
+              "name": "check_auth",
+              "description": "Check if API key is configured",
+              "input_schema": {
+                "type": "object",
+                "properties": {},
+                "required": []
+              },
+              "output_schema": {
+                "type": "object",
+                "properties": {
+                  "content": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "text"
+                        },
+                        "text": {
+                          "type": "string",
+                          "description": "Status message indicating whether the API key is configured"
+                        }
+                      },
+                      "required": ["type", "text"]
+                    }
+                  }
+                },
+                "required": ["content"]
+              }
+            }
+          ]
+        }
       }
     }
   }
