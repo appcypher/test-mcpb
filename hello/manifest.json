@@ -16,6 +16,12 @@
       }
     }
   },
+  "tools": [
+    {
+      "name": "hello",
+      "description": "Say hello"
+    }
+  ],
   "user_config": {
     "username": {
       "type": "string",
@@ -33,6 +39,44 @@
     "store.tool.mcpb": {
       "scripts": {
         "build": "cargo build --release"
+      },
+      "static_responses": {
+        "tools/list": {
+          "tools": [
+            {
+              "name": "hello",
+              "description": "Say hello",
+              "input_schema": {
+                "type": "object",
+                "properties": {},
+                "required": []
+              },
+              "output_schema": {
+                "type": "object",
+                "properties": {
+                  "content": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "text"
+                        },
+                        "text": {
+                          "type": "string",
+                          "description": "A personalized greeting message"
+                        }
+                      },
+                      "required": ["type", "text"]
+                    }
+                  }
+                },
+                "required": ["content"]
+              }
+            }
+          ]
+        }
       }
     }
   }

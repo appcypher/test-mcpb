@@ -3,10 +3,12 @@
   "name": "http",
   "version": "0.1.0",
   "description": "A simple HTTP MCP server without authentication",
+  "icon": "./icon.png",
   "author": {
     "name": "Stephen Akinyemi",
     "email": "appcypher@outlook.com"
   },
+  "license": "MIT",
   "server": {
     "type": "binary",
     "transport": "http",
@@ -20,6 +22,12 @@
       "url": "http://${user_config.host}:${system_config.port}/mcp"
     }
   },
+  "tools": [
+    {
+      "name": "hello",
+      "description": "Say hello"
+    }
+  ],
   "user_config": {
     "host": {
       "type": "string",
@@ -44,6 +52,44 @@
     "store.tool.mcpb": {
       "scripts": {
         "build": "cargo build --release"
+      },
+      "static_responses": {
+        "tools/list": {
+          "tools": [
+            {
+              "name": "hello",
+              "description": "Say hello",
+              "input_schema": {
+                "type": "object",
+                "properties": {},
+                "required": []
+              },
+              "output_schema": {
+                "type": "object",
+                "properties": {
+                  "content": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "text"
+                        },
+                        "text": {
+                          "type": "string",
+                          "description": "A greeting message from the HTTP server"
+                        }
+                      },
+                      "required": ["type", "text"]
+                    }
+                  }
+                },
+                "required": ["content"]
+              }
+            }
+          ]
+        }
       }
     }
   }
